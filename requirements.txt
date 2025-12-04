@@ -1,0 +1,16 @@
+# RaySID BLE Client - Python Requirements
+# Install with: pip install -r requirements.txt
+
+# Core BLE communication
+bleak>=0.20.0
+
+# CLI framework
+click>=8.0.0
+
+# Audio support for Geiger counter sounds (optional)
+numpy>=1.20.0
+sounddevice>=0.4.0
+
+# Graph generation (optional)
+matplotlib>=3.5.0
+
