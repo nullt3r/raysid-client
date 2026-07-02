@@ -106,6 +106,10 @@ class RaySIDClient:
         self.connected = False
         self.measurement_active = False
         self.active_tab = TAB_SEARCH
+        # BLEDevice from discovery — passed to BleakClient instead of a
+        # bare address string; on BlueZ this is far more reliable because
+        # it carries the backend object path (no internal re-scan).
+        self._ble_device = None
         # Keepalive task — must hold a reference: asyncio only keeps weak
         # references to tasks, so a bare create_task() can be GC'd mid-run.
         self._ping_task: Optional[asyncio.Task] = None
@@ -333,58 +337,98 @@ class RaySIDClient:
     
     # ==================== CONNECTION ====================
     
+    async def _scan_for_device(self, timeout: float = 6.0):
+        """Scan for a RaySID and return its BLEDevice, or None.
+
+        Cross-platform reliable: does an UNFILTERED scan (BlueZ's
+        service-UUID discovery filter needs the 128-bit UUID inside the
+        advertisement, which the RaySID's UART module doesn't fit there),
+        then matches on the service UUID from the advertisement data OR
+        the advertised name. Picks the strongest signal when several
+        match.
+        """
+        logger.info("Scanning for RaySID devices...")
+        try:
+            discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        except Exception as e:
+            logger.error(f"BLE scan failed: {e}")
+            logger.error("Check that Bluetooth is on and permitted "
+                         "(Linux: `bluetoothctl show` → Powered: yes; "
+                         "you may need to be in the 'bluetooth' group).")
+            return None
+
+        target_uuid = SERVICE_UUID.lower()
+        candidates = []  # (rssi, device)
+        for device, adv in discovered.values():
+            name = (adv.local_name or device.name or "")
+            adv_uuids = {u.lower() for u in (adv.service_uuids or [])}
+            if target_uuid in adv_uuids or "raysid" in name.lower():
+                rssi = adv.rssi if adv.rssi is not None else -999
+                candidates.append((rssi, device, name))
+
+        if not candidates:
+            logger.error("No RaySID device found. Make sure the device is "
+                         "powered on and nearby.")
+            logger.info("Seen %d BLE device(s) during scan; none matched. "
+                        "If you know the address, pass it with --address.",
+                        len(discovered))
+            return None
+
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        rssi, device, name = candidates[0]
+        logger.info(f"Found device: {name or 'RaySID'} [{device.address}] "
+                    f"(RSSI {rssi} dBm)")
+        return device
+
+    async def _open_connection(self, target) -> bool:
+        """Connect to a BLEDevice or address string and start notifications."""
+        self.client = BleakClient(target, disconnected_callback=self._on_disconnect)
+        try:
+            await self.client.connect()
+        except Exception as e:
+            logger.error(f"Connection failed: {e}")
+            return False
+        try:
+            await self.client.start_notify(RX_CHAR_UUID, self._notification_handler)
+        except Exception as e:
+            logger.error(f"Could not subscribe to notifications: {e}")
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            return False
+        self.connected = True
+        self._intentional_disconnect = False
+        logger.info(f"Connected to RaySID [{self.client.address}]")
+        return True
+
     async def scan_and_connect(self, target_address: Optional[str] = None) -> bool:
-        """Scan for and connect to RaySID device.
-        
+        """Scan for and connect to a RaySID device.
+
         Args:
-            target_address: Optional MAC address to connect to directly
-            
+            target_address: Optional MAC address (Linux) / UUID (macOS) to
+                connect to directly, skipping the scan.
+
         Returns:
             True if connection successful
         """
         target_address = target_address or self.target_address
-        
-        if not target_address:
-            logger.info("Scanning for RaySID devices...")
-            
-            try:
-                devices = await BleakScanner.discover(timeout=3.0, service_uuids=[SERVICE_UUID])
-                if devices:
-                    target_address = devices[0].address
-                    device_name = devices[0].name or 'RaySID'
-                    logger.info(f"Found device: {device_name} [{target_address}]")
-            except Exception:
-                pass
-            
-            if not target_address:
-                logger.info("Scanning by name...")
-                devices = await BleakScanner.discover(timeout=3.0)
-                for device in devices:
-                    if device.name and 'raysid' in device.name.lower():
-                        target_address = device.address
-                        logger.info(f"Found device: {device.name} [{target_address}]")
-                        break
-        
-        if not target_address:
-            logger.error("No RaySID device found. Make sure device is powered on and nearby.")
+
+        # Direct connect by address — skips scanning entirely.
+        if target_address:
+            self.target_address = target_address
+            logger.info(f"Connecting to {target_address}...")
+            connect_target = self._ble_device or target_address
+            return await self._open_connection(connect_target)
+
+        device = await self._scan_for_device()
+        if device is None:
             return False
-        
-        logger.info(f"Connecting to {target_address}...")
-        self.target_address = target_address
-        self.client = BleakClient(target_address, disconnected_callback=self._on_disconnect)
-        
-        try:
-            await self.client.connect()
-            logger.info(f"Connected to RaySID [{target_address}]")
-            
-            await self.client.start_notify(RX_CHAR_UUID, self._notification_handler)
-            self.connected = True
-            self._intentional_disconnect = False
-            
-            return True
-        except Exception as e:
-            logger.error(f"Connection failed: {e}")
-            return False
+
+        self._ble_device = device
+        self.target_address = device.address
+        logger.info(f"Connecting to {device.address}...")
+        return await self._open_connection(device)
     
     def _on_disconnect(self, client: BleakClient) -> None:
         """Callback when device disconnects unexpectedly."""
@@ -421,34 +465,48 @@ class RaySIDClient:
                 if self.client:
                     try:
                         await self.client.disconnect()
-                    except:
+                    except Exception:
                         pass
-                
+
                 if attempt == 1:
                     logger.info(f"Reconnecting to {self.target_address}...")
                 elif attempt % 5 == 0:
                     logger.info(f"Reconnection attempt {attempt}...")
-                
-                self.client = BleakClient(self.target_address, disconnected_callback=self._on_disconnect)
+
+                # Prefer the cached BLEDevice (reliable on BlueZ); a stale
+                # object can go invalid after the adapter drops the peer, so
+                # periodically re-scan to refresh it.
+                if self._ble_device is None or attempt % 3 == 0:
+                    refreshed = await self._scan_for_device()
+                    if refreshed is not None:
+                        self._ble_device = refreshed
+                        self.target_address = refreshed.address
+
+                connect_target = self._ble_device or self.target_address
+                if connect_target is None:
+                    raise RuntimeError("no device or address to reconnect to")
+
+                self.client = BleakClient(connect_target,
+                                          disconnected_callback=self._on_disconnect)
                 await self.client.connect()
-                
+
                 await self.client.start_notify(RX_CHAR_UUID, self._notification_handler)
                 self.connected = True
                 self._intentional_disconnect = False
-                
+
                 logger.info(f"Reconnected successfully after {attempt} attempt(s)")
-                
+
                 if reinitialize:
                     await self.initialize()
-                
+
                 self._reconnecting = False
                 return True
-                
+
             except asyncio.CancelledError:
                 logger.info("Reconnection cancelled by user")
                 self._reconnecting = False
                 raise
-                
+
             except Exception as e:
                 logger.debug(f"Reconnect attempt {attempt} failed: {e}")
                 await asyncio.sleep(self.retry_delay)
