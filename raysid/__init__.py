@@ -28,7 +28,6 @@ from .export import (
     save_spectrum,
     export_spectrum_csv,
     export_spectrum_json,
-    export_spectrum_graph,
     generate_filename,
 )
 
@@ -57,7 +56,6 @@ __all__ = [
     "save_spectrum",
     "export_spectrum_csv",
     "export_spectrum_json",
-    "export_spectrum_graph",
     "generate_filename",
 ]
 

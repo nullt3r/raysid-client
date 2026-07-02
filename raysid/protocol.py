@@ -50,13 +50,15 @@ CMD_SET_ENERGY_RANGE = 0x1E     # Set spectrum energy range: {0x1E, value} where
 CMD_SET_UPDATE_INTERVAL = 0x39  # Set sensitivity: {0x39, value} where value=1,4,16,64
 CMD_SET_SPECTRUM_CHANNELS = 0x3F  # Set spectrum channels: {0x3F, value} where value=0,1,3,9
 
-# Tick/Click settings commands
+# Tick/Click settings commands (verified against Main.java v1.3.1e
+# onSharedPreferenceChanged)
 CMD_SET_TICKS_ENABLED = 0x15    # Enable device ticks: {0x15, 0/1}
+CMD_SET_TICKS_SCALE = 0x16      # Tick divider 1:N: {0x16, n} (1/5/10/20/50/100/250)
 CMD_SET_TICK_SOUND = 0x03       # Device tick sound: {0x03, 0/1}
 CMD_SET_TICK_LED = 0x02         # Device LED flashes on tick: {0x02, 0/1}
 CMD_SET_TICK_ON_CLIENT = 0x1C   # Client handles tick sounds: {0x1C, 0/1}
-CMD_SET_TICK_DURATION = 0x19    # Tick sound duration: {0x19, hi, lo} (ms)
-CMD_SET_LED_DURATION = 0x32     # LED tick duration: {0x32, hi, lo} (ms)
+CMD_SET_TICK_DURATION = 0x19    # Tick sound TYPE code: {0x19, hi, lo} (1-5, 11-15)
+CMD_SET_LED_DURATION = 0x32     # LED tick length: {0x32, hi, lo} (units of 10 ms)
 
 # Alarm Level 1 (CPS) commands
 CMD_SET_ALARM1_ENABLED = 0x17   # Enable CPS alarm: {0x17, 0/1}
@@ -64,7 +66,7 @@ CMD_SET_ALARM1_THRESHOLD = 0x13 # CPS alarm threshold: {0x13, hi, lo}
 CMD_SET_ALARM1_LED = 0x05       # Alarm 1 LED: {0x05, 0/1}
 CMD_SET_ALARM1_SOUND = 0x06     # Alarm 1 sound: {0x06, 0/1}
 CMD_SET_ALARM1_VIBRO = 0x07     # Alarm 1 vibration: {0x07, 0/1}
-CMD_SET_ALARM1_ON_CLIENT = 0x3B # Alarm 1 sound on client: {0x3B, 0/1}
+CMD_SET_ALARM1_ON_CLIENT = 0x3B # Device ticks during alarm 1: {0x3B, 0/1} (app: level1_device_ticks)
 
 # Alarm Level 2 (Dose Rate) commands
 CMD_SET_ALARM2_ENABLED = 0x18   # Enable dose alarm: {0x18, 0/1}
@@ -72,7 +74,7 @@ CMD_SET_ALARM2_THRESHOLD = 0x14 # Dose alarm threshold: {0x14, hi, lo} (uSv/h ×
 CMD_SET_ALARM2_LED = 0x08       # Alarm 2 LED: {0x08, 0/1}
 CMD_SET_ALARM2_SOUND = 0x09     # Alarm 2 sound: {0x09, 0/1}
 CMD_SET_ALARM2_VIBRO = 0x0A     # Alarm 2 vibration: {0x0A, 0/1}
-CMD_SET_ALARM2_ON_CLIENT = 0x3C # Alarm 2 sound on client: {0x3C, 0/1}
+CMD_SET_ALARM2_ON_CLIENT = 0x3C # Device ticks during alarm 2: {0x3C, 0/1} (app: level2_device_ticks)
 
 CMD_ENABLE_MEASUREMENT = 0x3E
 CMD_DOSE_RESET = 0x41
@@ -95,30 +97,9 @@ TAB_LOG = 3         # Event log
 TAB_SETTINGS = 4    # Settings
 TAB_DEV = 5         # Developer
 
-# Energy range parameters (keV)
-ENERGY_RANGES = {
-    8: (45, 3500),   # 45-3500 keV
-    4: (30, 2000),   # 30-2000 keV
-    2: (25, 1000),   # 25-1000 keV
-}
-
-ENERGY_RANGE_NAMES = {
-    8: "45-3500 keV",
-    4: "30-2000 keV",
-    2: "25-1000 keV",
-}
-
-SENSITIVITY_NAMES = {
-    1: "Fast",
-    4: "Normal",
-    16: "Accurate",
-    64: "Very Accurate",
-}
-
-CHANNEL_NAMES = {
-    1: "1800 (full)",
-    3: "600",
-    9: "200",
-    0: "Auto",
-}
+# Energy range codes verified against the decompiled app
+# (SpectrumUtils.recalculateEnergyCalibration, v1.3.1e): code 8 is the
+# NARROW ~1000 keV range ("1k-" calibration files), code 2 the wide
+# ~3500 keV one ("3k-"). The keV axis is non-linear — see
+# raysid/calibration.py; display labels live in raysid/device_settings.py.
 

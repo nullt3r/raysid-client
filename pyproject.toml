@@ -31,13 +31,13 @@ audio = [
     "numpy>=1.20.0",
     "sounddevice>=0.4.0",
 ]
-graph = [
-    "matplotlib>=3.5.0",
+tui = [
+    "textual>=0.50.0",
 ]
 all = [
     "numpy>=1.20.0",
     "sounddevice>=0.4.0",
-    "matplotlib>=3.5.0",
+    "textual>=0.50.0",
 ]
 
 [project.scripts]

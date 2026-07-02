@@ -14,7 +14,7 @@ from raysid import (
     SpectrumData,
     DeviceSettings,
 )
-from raysid.protocol import ENERGY_RANGE_NAMES, SENSITIVITY_NAMES, CHANNEL_NAMES
+from raysid.device_settings import SETTINGS, SETTING_GROUPS
 from raysid.models import CONFIG_FILE
 from raysid.logging_config import get_logger
 from raysid.export import (
@@ -42,12 +42,115 @@ def print_spectrum_summary(spectrum: SpectrumData) -> None:
         print(f"Temperature:      {spectrum.temperature:.1f}C")
     else:
         print(f"Temperature:      N/A")
-    
-    peaks = spectrum.find_peaks(threshold=0.05, min_distance=30)
+
+
+def print_source_identification(spectrum: SpectrumData) -> None:
+    """Background verdict, detected peaks + probable sources (same code
+    path as the TUI: raysid.background + raysid.nuclides)."""
+    from raysid import background as bgmod
+    from raysid import nuclides
+
+    bg = bgmod.load_background(spectrum.energy_range)
+    if bg is not None and spectrum.real_time > 0:
+        net = bgmod.compute_net(spectrum.channels, spectrum.real_time, bg)
+        print(f"\nBackground comparison (ref: {bg.counts_sum:,.0f} cts / "
+              f"{bg.real_time:.0f}s, {bg.age_hours:.1f}h old):")
+        print(f"  {bgmod.verdict_line(net)}")
+    elif bg is None:
+        print("\n(no background reference — measure one with: raysid background --measure 600)")
+
+    library = nuclides.load_library(spectrum.energy_range)
+    if not library:
+        print("(no nuclide library imported — run: raysid library --import <apk/xapk>)")
+        return
+
+    peaks = nuclides.detect_peaks(
+        spectrum.channels, spectrum.real_time, spectrum.total_counts,
+        spectrum.energy_range, spectrum.channel_th_avg)
+    matches = nuclides.identify(
+        spectrum.channels, spectrum.real_time, spectrum.total_counts,
+        spectrum.energy_range, spectrum.channel_th_avg, library,
+        detected=peaks, bg=bg)
+
     if peaks:
-        print(f"\nDetected Peaks (top 5):")
-        for i, peak in enumerate(peaks[:5]):
-            print(f"  {i+1}. {peak['energy_kev']:.1f} keV (ch {peak['channel']}, {peak['counts']:,} counts)")
+        print(f"\nDetected Peaks:")
+        for p in peaks:
+            print(f"  {p.center_kev:>5} keV  (ch {p.center}, {p.cps:.2f} CPS)")
+
+    if matches:
+        note = " (background-subtracted)" if bg is not None else ""
+        print(f"\nProbable Sources{note} (similarity 0-100):")
+        for m in matches[:5]:
+            print(f"  {m.similarity:5.1f}  {m.source.name:<22} "
+                  f"{m.source.lib:<8} peaks {m.matched_peaks}/{m.total_lib_peaks}")
+    elif sum(spectrum.channels) < nuclides.MIN_TICKS_FOR_ID:
+        print("\n(identification needs at least 100 counts — accumulate longer)")
+
+
+async def cmd_background(client: RaySIDClient, opts, args) -> None:
+    """Background command - measure or capture a background reference."""
+    import asyncio
+    from raysid import background as bgmod
+
+    if getattr(args, 'measure', None):
+        seconds = args.measure
+        print(f"Measuring background for {seconds}s — remove any samples "
+              f"from the detector now.")
+        await client.clear_spectrum(client.settings.spectrum_energy_range)
+        await asyncio.sleep(2)
+        remaining = seconds
+        while remaining > 0:
+            step = min(30, remaining)
+            await asyncio.sleep(step)
+            remaining -= step
+            print(f"  …{remaining}s remaining")
+
+    spectrum = await client.sync_spectrum()
+    if not spectrum or not spectrum.real_time:
+        print("No spectrum data received — cannot save background")
+        return
+    spectrum.device_id = client.device_info.device_id
+
+    path = bgmod.save_background(spectrum)
+    print(f"\nBackground saved: {path}")
+    print(f"  {sum(spectrum.channels):,.0f} counts / {spectrum.real_time:.0f}s "
+          f"({sum(spectrum.channels)/spectrum.real_time:.2f} CPS), "
+          f"energy range {spectrum.get_energy_range_str()}")
+
+
+def _measurement_log_paths(args) -> tuple:
+    """Resolve (csv_path, json_path) from --csv/--json/-o arguments."""
+    save_csv = getattr(args, 'csv', False)
+    save_json = getattr(args, 'json', False)
+    output_base = getattr(args, 'output', None)
+    csv_path = None
+    json_path = None
+    if save_csv:
+        csv_path = output_base if output_base and output_base.endswith('.csv') else \
+                  f"{output_base}.csv" if output_base else \
+                  generate_filename('raysid_monitor', 'csv')
+    if save_json:
+        json_path = output_base if output_base and output_base.endswith('.json') else \
+                   f"{output_base}.json" if output_base else \
+                   generate_filename('raysid_monitor', 'json')
+    return csv_path, json_path
+
+
+async def cmd_tui(client: RaySIDClient, opts, args) -> None:
+    """TUI command - the full-screen dashboard (main interface)."""
+    from raysid.tui import run_monitor_tui
+
+    csv_path, json_path = _measurement_log_paths(args)
+    with MeasurementLogger(csv_path=csv_path, json_path=json_path,
+                           device_info=client.device_info) as data_logger:
+        def tui_callback(data: MeasurementData):
+            data_logger.log(
+                data,
+                temperature_c=client.device_info.temperature_celsius,
+                battery_percent=client.device_info.battery_percent,
+            )
+        await run_monitor_tui(client, duration=args.duration,
+                              on_measurement=tui_callback)
 
 
 async def cmd_monitor(client: RaySIDClient, opts, args) -> None:
@@ -60,28 +163,8 @@ async def cmd_monitor(client: RaySIDClient, opts, args) -> None:
     if client.tick_generator:
         print(f"Sound: ON (scale 1:{client.tick_generator.tick_scale})")
     
-    # Setup file logging using unified export module
-    save_csv = getattr(args, 'csv', False)
-    save_json = getattr(args, 'json', False)
-    output_base = getattr(args, 'output', None)
-    
-    # Generate filenames
-    csv_path = None
-    json_path = None
-    
-    if save_csv or save_json:
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        if save_csv:
-            csv_path = output_base if output_base and output_base.endswith('.csv') else \
-                      f"{output_base}.csv" if output_base else \
-                      generate_filename('raysid_monitor', 'csv')
-        
-        if save_json:
-            json_path = output_base if output_base and output_base.endswith('.json') else \
-                       f"{output_base}.json" if output_base else \
-                       generate_filename('raysid_monitor', 'json')
-    
+    csv_path, json_path = _measurement_log_paths(args)
+
     print("Press Ctrl+C to stop\n")
     
     # Use unified MeasurementLogger from export module
@@ -117,260 +200,37 @@ async def cmd_monitor(client: RaySIDClient, opts, args) -> None:
 
 
 async def cmd_spectrum(client: RaySIDClient, opts, args) -> None:
-    """Spectrum acquisition command with graph and CSV export."""
-    
-    wants_output = args.output or args.json or args.csv or args.graph
-    
-    # Handle --clear option
+    """Spectrum command - download the device's accumulated spectrum.
+
+    Mirrors the TUI spectrum panel: sync (and optionally clear first),
+    print a summary, optionally save the data as CSV/JSON.
+    """
     if args.clear:
         await client.clear_spectrum(client.settings.spectrum_energy_range)
-        if not args.sync and not wants_output and not args.interval:
-            print("Spectrum cleared. Use --graph, --csv, or --timeout to acquire after clearing.")
+        if not args.sync and not (args.output or args.json or args.csv):
             return
         import asyncio
         await asyncio.sleep(0.5)
-    
-    # Handle --sync option
-    if args.sync:
-        spectrum = await client.sync_spectrum()
-        if not spectrum:
-            print("No spectrum data to sync")
-            return
-        
-        spectrum.energy_range = client.settings.spectrum_energy_range
-        spectrum.device_id = client.device_info.device_id
-        spectrum.temperature = client.device_info.temperature_celsius
-        
-        print_spectrum_summary(spectrum)
-        
-        if args.output or args.json or args.csv or args.graph:
-            base_name = args.output or f"spectrum_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            if base_name.endswith('.json') or base_name.endswith('.csv') or base_name.endswith('.png'):
-                base_name = base_name.rsplit('.', 1)[0]
-            
-            save_json = args.json or args.output
-            save_csv = args.csv or args.output
-            save_graph = args.graph or args.output
-            
-            title = args.title or f"RaySID Gamma Spectrum ({spectrum.get_energy_range_str()})"
-            saved = save_spectrum(spectrum, base_name, save_csv=save_csv, save_json=save_json, save_graph=save_graph,
-                                  log_scale=args.log_scale, show_peaks=not args.no_peaks, title=title)
-            if saved:
-                print(f"\nSaved: {', '.join(saved)}")
-        return
-    
-    # Continuous mode
-    if args.interval and args.interval > 0:
-        await cmd_spectrum_continuous(client, opts, args)
-        return
-    
-    # Delta mode
-    if hasattr(args, 'delta') and args.delta and args.delta > 0:
-        await cmd_spectrum_delta(client, opts, args)
-        return
-    
-    # Single acquisition
-    print(f"Acquiring spectrum (timeout: {args.timeout}s)...")
-    spectrum = await client.acquire_spectrum(timeout=args.timeout)
-    
+
+    spectrum = await client.sync_spectrum()
     if not spectrum:
-        print("Acquisition failed or timed out")
+        print("No spectrum data received")
         return
-    
-    spectrum.energy_range = client.settings.spectrum_energy_range
+
     spectrum.device_id = client.device_info.device_id
-    spectrum.temperature = client.device_info.temperature_celsius
-    
+
     print_spectrum_summary(spectrum)
-    
-    base_name = args.output or f"spectrum_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    if base_name.endswith('.json') or base_name.endswith('.csv') or base_name.endswith('.png'):
-        base_name = base_name.rsplit('.', 1)[0]
-    
-    save_json = args.json or args.output
-    save_csv = args.csv or args.output
-    save_graph = args.graph or args.output
-    
-    title = args.title or f"RaySID Gamma Spectrum ({spectrum.get_energy_range_str()})"
-    saved = save_spectrum(spectrum, base_name, save_csv=save_csv, save_json=save_json, save_graph=save_graph,
-                          log_scale=args.log_scale, show_peaks=not args.no_peaks, title=title)
-    
-    if saved:
-        print(f"\nSaved: {', '.join(saved)}")
+    print_source_identification(spectrum)
 
-
-async def cmd_spectrum_delta(client: RaySIDClient, opts, args) -> None:
-    """Delta spectrum mode: subtract background from sample measurement."""
-    import asyncio
-    
-    acq_time = args.delta
-    
-    print(f"\n{'='*60}")
-    print("Delta Spectrum Mode (Background Subtraction)")
-    print(f"{'='*60}")
-    print(f"Acquisition time: {acq_time} seconds per phase")
-    print(f"{'='*60}\n")
-    
-    # Phase 1: Background
-    print("=" * 50)
-    print("PHASE 1: BACKGROUND MEASUREMENT")
-    print("=" * 50)
-    print("Remove any radioactive sources from the area.")
-    print("Press ENTER when ready...")
-    input()
-    
-    print("\nClearing device spectrum...")
-    await client.clear_spectrum(client.settings.spectrum_energy_range)
-    await asyncio.sleep(1.0)
-    
-    print(f"Measuring background for {acq_time} seconds...")
-    background = await client.acquire_spectrum(timeout=acq_time)
-    
-    if not background:
-        print("Background acquisition failed")
-        return
-    
-    background.energy_range = client.settings.spectrum_energy_range
-    bg_counts = sum(background.channels)
-    bg_cps = bg_counts / acq_time if acq_time > 0 else 0
-    print(f"Background: {bg_counts:,} counts ({bg_cps:.1f} CPS)")
-    
-    # Phase 2: Sample
-    print("\n" + "=" * 50)
-    print("PHASE 2: SAMPLE MEASUREMENT")
-    print("=" * 50)
-    print("Place the radioactive sample near the detector.")
-    print("Press ENTER when ready...")
-    input()
-    
-    print("\nClearing device spectrum...")
-    await client.clear_spectrum(client.settings.spectrum_energy_range)
-    await asyncio.sleep(1.0)
-    
-    print(f"Measuring sample for {acq_time} seconds...")
-    sample = await client.acquire_spectrum(timeout=acq_time)
-    
-    if not sample:
-        print("Sample acquisition failed")
-        return
-    
-    sample.energy_range = client.settings.spectrum_energy_range
-    sample_counts = sum(sample.channels)
-    sample_cps = sample_counts / acq_time if acq_time > 0 else 0
-    print(f"Sample: {sample_counts:,} counts ({sample_cps:.1f} CPS)")
-    
-    # Phase 3: Calculate difference
-    print("\n" + "=" * 50)
-    print("PHASE 3: CALCULATING DIFFERENCE")
-    print("=" * 50)
-    
-    delta_spectrum = sample.subtract(background, normalize=True)
-    
-    positive_sum = sum(c for c in delta_spectrum.channels if c > 0)
-    negative_sum = sum(c for c in delta_spectrum.channels if c < 0)
-    net_delta = sum(delta_spectrum.channels)
-    
-    print(f"\nResults:")
-    print(f"  Above background: {positive_sum:,} counts")
-    print(f"  Below background: {negative_sum:,} counts")
-    print(f"  Net difference:   {net_delta:+,} counts")
-    
-    print_spectrum_summary(delta_spectrum)
-    
-    # Save outputs
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    base_name = args.output or f"spectrum_delta_{timestamp}"
-    if base_name.endswith('.json') or base_name.endswith('.csv') or base_name.endswith('.png'):
-        base_name = base_name.rsplit('.', 1)[0]
-    
-    title = args.title or f"RaySID Delta Spectrum (Background Subtracted)"
-    saved = save_spectrum(delta_spectrum, base_name, save_csv=args.csv, save_json=True, save_graph=True,
-                          log_scale=args.log_scale, show_peaks=not args.no_peaks, title=title)
-    
-    # Save background and sample
-    save_spectrum(background, f"{base_name}_background", save_csv=False, save_json=True, save_graph=False)
-    save_spectrum(sample, f"{base_name}_sample", save_csv=False, save_json=True, save_graph=False)
-    
-    if saved:
-        print(f"\nDelta spectrum saved: {', '.join(saved)}")
-        print(f"Background saved: {base_name}_background.json")
-        print(f"Sample saved: {base_name}_sample.json")
-
-
-async def cmd_spectrum_continuous(client: RaySIDClient, opts, args) -> None:
-    """Continuous spectrum acquisition with periodic saving."""
-    import asyncio
-    
-    interval = args.interval
-    duration = args.duration if hasattr(args, 'duration') and args.duration else 0
-    
-    print(f"\n{'='*60}")
-    print("Continuous Spectrum Acquisition")
-    print(f"{'='*60}")
-    print(f"Save interval:  {interval} seconds")
-    print(f"Duration:       {'indefinite' if duration == 0 else f'{duration} seconds'}")
-    print(f"\nPress Ctrl+C to stop")
-    print(f"{'='*60}\n")
-    
-    output_dir = args.output or "spectrum_data"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"Created output directory: {output_dir}")
-    
-    start_time = time.time()
-    save_count = 0
-    last_save_time = start_time
-    
-    save_json = args.json or True
-    save_csv = args.csv
-    save_graph = args.graph
-    
-    try:
-        while True:
-            current_time = time.time()
-            elapsed = current_time - start_time
-            
-            if duration > 0 and elapsed >= duration:
-                print(f"\nDuration limit reached ({duration}s)")
-                break
-            
-            if current_time - last_save_time >= interval:
-                save_count += 1
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                
-                print(f"\nAcquiring spectrum #{save_count}...")
-                spectrum = await client.acquire_spectrum(timeout=args.timeout)
-                
-                if spectrum:
-                    spectrum.energy_range = client.settings.spectrum_energy_range
-                    spectrum.device_id = client.device_info.device_id
-                    spectrum.temperature = client.device_info.temperature_celsius
-                    spectrum.acquisition_time = elapsed
-                    
-                    base_name = f"{output_dir}/spectrum_{timestamp}_{save_count:04d}"
-                    title = f"Spectrum #{save_count} ({spectrum.get_energy_range_str()})"
-                    
-                    save_spectrum(spectrum, base_name, save_csv=save_csv, save_json=save_json, save_graph=save_graph,
-                                  log_scale=args.log_scale, show_peaks=not args.no_peaks, title=title)
-                    
-                    print(f"#{save_count}: {spectrum.total_counts:,} counts, saved to {output_dir}/")
-                else:
-                    print(f"#{save_count}: Acquisition failed")
-                
-                last_save_time = current_time
-            
-            time_to_next = interval - (current_time - last_save_time)
-            print(f"\rNext save in {time_to_next:.0f}s (elapsed: {elapsed:.0f}s)   ", end="", flush=True)
-            
-            await asyncio.sleep(1)
-            
-    except asyncio.CancelledError:
-        pass
-    
-    print(f"\n\nContinuous acquisition stopped")
-    print(f"Total acquisitions: {save_count}")
-    print(f"Total time: {time.time() - start_time:.0f} seconds")
-    print(f"Data saved to: {output_dir}/")
+    if args.output or args.json or args.csv:
+        base_name = args.output or f"spectrum_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        saved = save_spectrum(
+            spectrum, base_name,
+            save_csv=bool(args.csv or args.output),
+            save_json=bool(args.json or args.output),
+        )
+        if saved:
+            print(f"\nSaved: {', '.join(saved)}")
 
 
 async def cmd_info(client: RaySIDClient, opts, args) -> None:
@@ -401,11 +261,12 @@ async def cmd_info(client: RaySIDClient, opts, args) -> None:
     print(f"  Spectrum:  {'Full' if reading.spectrum_full else 'Recording'}")
     
     print(f"\nCurrent Settings:")
-    print(f"  CPS Alarm:        {client.settings.get_alarm1_threshold_str()}")
-    print(f"  Dose Alarm:       {client.settings.get_alarm2_threshold_str()}")
-    print(f"  Device Ticks:     {'Enabled' if client.settings.ticks_enabled else 'Disabled'}")
-    print(f"  Spectrum Range:   {ENERGY_RANGE_NAMES.get(client.settings.spectrum_energy_range, 'Unknown')}")
-    print(f"  Units:            {client.settings.dose_rate_units}")
+    for key, label in (("alarm1_threshold", "CPS Alarm"),
+                       ("alarm2_threshold", "Dose Alarm"),
+                       ("ticks_enabled", "Device Ticks"),
+                       ("spectrum_energy_range", "Spectrum Range")):
+        sdef = SETTINGS[key]
+        print(f"  {label + ':':<18}{sdef.display(getattr(client.settings, key))}")
 
 
 async def cmd_settings(client: RaySIDClient, opts, args) -> None:
@@ -415,146 +276,74 @@ async def cmd_settings(client: RaySIDClient, opts, args) -> None:
         print("\n" + "="*60)
         print("RaySID Settings")
         print("="*60)
-        
-        print("\nSpectrum Settings (sent to device):")
-        print(f"  Sensitivity:        {client.settings.get_sensitivity_name()} ({client.settings.update_interval}s averaging)")
-        print(f"  Energy Range:       {ENERGY_RANGE_NAMES.get(client.settings.spectrum_energy_range, 'Unknown')}")
-        print(f"  Spectrum Channels:  {CHANNEL_NAMES.get(client.settings.spectrum_channels, 'Unknown')}")
-        
-        print("\nTick/Click Settings (sent to device):")
-        print(f"  Device Ticks:       {'Enabled' if client.settings.ticks_enabled else 'Disabled'}")
-        print(f"  Tick Sound:         {'On' if client.settings.tick_sound else 'Off'}")
-        print(f"  Tick LED Flash:     {'On' if client.settings.tick_led else 'Off'}")
-        print(f"  Tick on Client:     {'On' if client.settings.tick_on_client else 'Off'}")
-        print(f"  Tick Duration:      {client.settings.tick_duration} ms")
-        print(f"  LED Duration:       {client.settings.led_duration * 10} ms")
-        
-        print("\nAlarm 1 - CPS (sent to device):")
-        print(f"  Enabled:            {'Yes' if client.settings.alarm1_enabled else 'No'}")
-        print(f"  Threshold:          {client.settings.get_alarm1_threshold_str()}")
-        print(f"  LED:                {'On' if client.settings.alarm1_led else 'Off'}")
-        print(f"  Sound:              {'On' if client.settings.alarm1_sound else 'Off'}")
-        print(f"  Vibration:          {'On' if client.settings.alarm1_vibro else 'Off'}")
-        print(f"  On Client:          {'On' if client.settings.alarm1_on_client else 'Off'}")
-        
-        print("\nAlarm 2 - Dose Rate (sent to device):")
-        print(f"  Enabled:            {'Yes' if client.settings.alarm2_enabled else 'No'}")
-        print(f"  Threshold:          {client.settings.get_alarm2_threshold_str()}")
-        print(f"  LED:                {'On' if client.settings.alarm2_led else 'Off'}")
-        print(f"  Sound:              {'On' if client.settings.alarm2_sound else 'Off'}")
-        print(f"  Vibration:          {'On' if client.settings.alarm2_vibro else 'Off'}")
-        print(f"  On Client:          {'On' if client.settings.alarm2_on_client else 'Off'}")
-        
+
+        # Device settings — one listing driven by the same registry the
+        # TUI menu and client.apply_setting() use.
+        for group, defs in SETTING_GROUPS:
+            print(f"\n{group} (sent to device):")
+            for sdef in defs:
+                value = getattr(client.settings, sdef.key)
+                print(f"  {sdef.key:<24}{sdef.label + ':':<22}{sdef.display(value)}")
+
         print("\nClient Settings (local only):")
-        print(f"  Python Clicks:      {'Enabled' if client.settings.clicks_enabled else 'Disabled'}")
         print(f"  Clicks Scale:       1:{client.settings.clicks_scale}")
-        print(f"  Spectrum Scale:     {client.settings.spectrum_scale}")
-        print(f"  Dose Rate Units:    {client.settings.dose_rate_units}")
         
         print(f"\nConfig file: {CONFIG_FILE}")
         return
     
-    # Set individual settings
+    # Set individual settings — every device setting goes through
+    # client.apply_setting(), the same code path the TUI menu uses.
     changed = False
-    
+
+    async def apply(key: str, value) -> None:
+        nonlocal changed
+        sdef = SETTINGS[key]
+        if await client.apply_setting(key, value):
+            print(f"{sdef.label}: {sdef.display(value)}")
+            changed = True
+        else:
+            valid = ", ".join(str(v) for v in sdef.values())
+            print(f"{sdef.label}: invalid value {value!r} (valid: {valid})")
+
     if args.sensitivity is not None:
         sensitivity_map = {"fast": 1, "normal": 4, "accurate": 16, "very-accurate": 64}
-        value = sensitivity_map[args.sensitivity]
-        await client.set_sensitivity(value)
-        changed = True
-    
+        await apply("update_interval", sensitivity_map[args.sensitivity])
+
     if args.energy_range is not None:
-        kev_to_code = {1000: 2, 2000: 4, 3500: 8}
-        code = kev_to_code[args.energy_range]
-        await client.set_energy_range(code)
-        changed = True
-    
+        await apply("spectrum_energy_range", args.energy_range)
+
     if args.channels is not None:
         channels_to_code = {1800: 1, 600: 3, 200: 9, 0: 0}
-        code = channels_to_code[args.channels]
-        await client.set_spectrum_channels(code)
-        changed = True
-    
+        await apply("spectrum_channels", channels_to_code.get(args.channels, args.channels))
+
     if args.ticks is not None:
-        await client.set_ticks_enabled(args.ticks)
-        changed = True
-    
+        await apply("ticks_enabled", args.ticks)
+
     if args.tick_sound is not None:
-        await client.set_tick_sound(args.tick_sound)
-        changed = True
-    
+        await apply("tick_sound", args.tick_sound)
+
     if args.tick_led is not None:
-        await client.set_tick_led(args.tick_led)
-        changed = True
-    
-    if hasattr(args, 'tick_duration') and args.tick_duration is not None:
-        if 1 <= args.tick_duration <= 1000:
-            from raysid.protocol import CMD_SET_TICK_DURATION
-            await client.send_command(CMD_SET_TICK_DURATION, bytes([args.tick_duration // 256, args.tick_duration % 256]))
-            client.settings.tick_duration = args.tick_duration
-            client.settings.save_to_file()
-            print(f"Tick duration set to: {args.tick_duration} ms")
-            changed = True
+        await apply("tick_led", args.tick_led)
+
+    # Generic access to ANY device setting: --set key=value
+    for key, raw in getattr(args, 'set_pairs', ()):
+        sdef = SETTINGS.get(key)
+        if sdef is None:
+            print(f"Unknown setting: {key}")
+            print(f"Valid keys: {', '.join(sorted(SETTINGS))}")
+            continue
+        if sdef.encoding == "bool":
+            value = raw.lower() in ("on", "true", "1", "yes")
         else:
-            print("Tick duration must be 1-1000 ms")
-    
-    if hasattr(args, 'led_duration') and args.led_duration is not None:
-        if 1 <= args.led_duration <= 100:
-            from raysid.protocol import CMD_SET_LED_DURATION
-            await client.send_command(CMD_SET_LED_DURATION, bytes([args.led_duration // 256, args.led_duration % 256]))
-            client.settings.led_duration = args.led_duration
-            client.settings.save_to_file()
-            print(f"LED duration set to: {args.led_duration * 10} ms")
-            changed = True
-        else:
-            print("LED duration must be 1-100 (10-1000 ms)")
-    
-    # Alarm 1 (CPS) settings
-    if hasattr(args, 'alarm1') and args.alarm1 is not None:
-        from raysid.protocol import CMD_SET_ALARM1_ENABLED
-        await client.send_command(CMD_SET_ALARM1_ENABLED, bytes([1 if args.alarm1 else 0]))
-        client.settings.alarm1_enabled = args.alarm1
-        client.settings.save_to_file()
-        print(f"CPS alarm {'enabled' if args.alarm1 else 'disabled'}")
-        changed = True
-    
-    if hasattr(args, 'alarm1_threshold') and args.alarm1_threshold is not None:
-        if 0 <= args.alarm1_threshold <= 65535:
-            from raysid.protocol import CMD_SET_ALARM1_THRESHOLD
-            await client.send_command(CMD_SET_ALARM1_THRESHOLD, bytes([args.alarm1_threshold // 256, args.alarm1_threshold % 256]))
-            client.settings.alarm1_threshold = args.alarm1_threshold
-            client.settings.save_to_file()
-            print(f"CPS alarm threshold set to: {args.alarm1_threshold} CPS")
-            changed = True
-        else:
-            print("CPS threshold must be 0-65535")
-    
-    # Alarm 2 (Dose Rate) settings
-    if hasattr(args, 'alarm2') and args.alarm2 is not None:
-        from raysid.protocol import CMD_SET_ALARM2_ENABLED
-        await client.send_command(CMD_SET_ALARM2_ENABLED, bytes([1 if args.alarm2 else 0]))
-        client.settings.alarm2_enabled = args.alarm2
-        client.settings.save_to_file()
-        print(f"Dose rate alarm {'enabled' if args.alarm2 else 'disabled'}")
-        changed = True
-    
-    if hasattr(args, 'alarm2_threshold') and args.alarm2_threshold is not None:
-        value = int(args.alarm2_threshold * 100)  # Convert uSv/h to device units
-        if 0 <= value <= 65535:
-            from raysid.protocol import CMD_SET_ALARM2_THRESHOLD
-            await client.send_command(CMD_SET_ALARM2_THRESHOLD, bytes([value // 256, value % 256]))
-            client.settings.alarm2_threshold = value
-            client.settings.save_to_file()
-            print(f"Dose rate alarm threshold set to: {args.alarm2_threshold:.2f} uSv/h")
-            changed = True
-        else:
-            print("Dose rate threshold must be 0-655.35 uSv/h")
-    
+            try:
+                value = int(raw)
+            except ValueError:
+                print(f"{sdef.label}: {raw!r} is not a number")
+                continue
+        await apply(key, value)
+
     if args.clicks is not None:
-        client.settings.clicks_enabled = args.clicks
-        client.settings.save_to_file()
-        print(f"Python clicks {'enabled' if args.clicks else 'disabled'}")
-        changed = True
+        await apply("tick_on_client", args.clicks)
     
     if args.clicks_scale is not None:
         client.settings.clicks_scale = args.clicks_scale
@@ -563,16 +352,7 @@ async def cmd_settings(client: RaySIDClient, opts, args) -> None:
         client.settings.save_to_file()
         print(f"Clicks scale set to: 1:{args.clicks_scale}")
         changed = True
-    
-    if args.units is not None:
-        if args.units in ["uSv/h", "mR/h", "uR/h"]:
-            client.settings.dose_rate_units = args.units
-            client.settings.save_to_file()
-            print(f"Dose rate units set to: {args.units}")
-            changed = True
-        else:
-            print("Units must be: uSv/h, mR/h, or uR/h")
-    
+
     if not changed and not args.show:
         print("No settings changed. Use --show to view current settings.")
 

@@ -49,13 +49,15 @@ def unpack_value(value: int) -> int:
     """Unpack encoded value (exponential format)."""
     exponent = value // 6000
     mantissa = value % 6000
-    for _ in range(exponent):
-        mantissa *= 10
-    return mantissa
+    return mantissa * (10 ** exponent)
 
 
 def calculate_crc32(data: bytes) -> int:
-    """Calculate CRC32 (firmware compatible)."""
+    """Firmware packet checksum (name kept from BLEservice.java).
+
+    Despite the name this is NOT a real CRC32 — it sums the data as
+    little-endian 32-bit words. Must stay bit-identical to the firmware.
+    """
     crc = 0
     for i in range(0, len(data), 4):
         remaining = len(data) - i
@@ -79,19 +81,21 @@ def checksum2(data: bytes) -> int:
     return checksum & 0xFF
 
 
-def checksum3(data: bytes, length: int) -> int:
+def checksum3(data, length: int, offset: int = 0) -> int:
     """3-byte XOR checksum used for packet validation.
-    
+
     From BLEservice.java checksum3():
-    XORs data in 3-byte triplets, returning 24-bit result.
+    XORs `length` bytes starting at `offset` in 3-byte triplets,
+    returning 24-bit result. Accepts bytes or bytearray so callers can
+    checksum in place without copying.
     """
     result = 0
-    for i in range(0, length, 3):
-        b0 = data[i] & 0xFF if i < length else 0
-        b1 = data[i + 1] & 0xFF if i + 1 < length else 0
-        b2 = data[i + 2] & 0xFF if i + 2 < length else 0
-        triplet = (b0 << 16) | (b1 << 8) | b2
-        result ^= triplet
+    end = offset + length
+    for i in range(offset, end, 3):
+        b0 = data[i] & 0xFF
+        b1 = data[i + 1] & 0xFF if i + 1 < end else 0
+        b2 = data[i + 2] & 0xFF if i + 2 < end else 0
+        result ^= (b0 << 16) | (b1 << 8) | b2
     return result & 0xFFFFFF
 
 
@@ -115,24 +119,17 @@ def parse_packet(packet: bytes) -> Dict:
     Length byte = total packet size (N bytes)
     Data = packet[2:N-3] (between type and checksum)
     """
-    if len(packet) < 5:  # Minimum: len + type + 1 data + 3 checksum
+    if len(packet) < 5:  # Minimum: len + type + 3 checksum (no data)
         return {"valid": False, "error": "Too short"}
-    
-    length = packet[0]
-    if length == 0:
-        length = 256
-    
+
     packet_type = packet[1]
-    
-    # Check if this is a spectrum packet
-    is_spectrum_packet = packet_type in [0x30, 0x31, 0x32]
-    
-    if is_spectrum_packet:
-        # For spectrum packets, pass the RAW packet
-        data = packet[:-3] if len(packet) > 3 else packet
+
+    if packet_type in (0x30, 0x31, 0x32):
+        # Spectrum packets: handler needs the raw packet (minus checksum)
+        data = packet[:-3]
     else:
         # Regular packets: data is from byte 2 to N-3
-        data = packet[2:-3] if len(packet) > 5 else packet[2:]
+        data = packet[2:-3]
     
     return {
         "valid": True,
@@ -162,12 +159,25 @@ def handle_status(client: 'RaySIDClient', data: bytes) -> None:
         if len(data) > 4:
             client.device_info.is_charging = (data[4] & 0xFF) > 0
         
+        # Cs-137 peak position channel (bytes 5-8): instantaneous and
+        # running average, both signed with +700 offset. The average
+        # parameterizes the energy calibration (see calibration.py).
+        # Java: channelTh = twoBytesToShort(bArr[8], bArr[7]) + 700;
+        #       channelThAvg = twoBytesToShort(bArr[10], bArr[9]) / 100 + 700
+        if len(data) >= 9:
+            client.device_info.channel_th = (
+                int.from_bytes(bytes([data[6], data[5]]), 'big', signed=True) + 700
+            )
+            client.device_info.channel_th_avg = (
+                int.from_bytes(bytes([data[8], data[7]]), 'big', signed=True) / 100.0 + 700.0
+            )
+
         # Status flags (byte 9)
         if len(data) > 9:
             flags = data[9] & 0xFF
             client.measurement.temperature_ok = (flags % 2) == 1
             client.measurement.spectrum_full = ((flags // 2) % 2) == 1
-        
+
         logger.debug(f"Status: Temp={temp_celsius:.1f}C, Battery={battery}%, Charging={client.device_info.is_charging}")
 
 
@@ -179,13 +189,10 @@ def handle_measurement(client: 'RaySIDClient', data: bytes) -> None:
     cps = -1.0
     energy = -1.0
     
-    num_triplets = 12 if len(data) > 18 else 2
-    
+    num_triplets = len(data) // 3
+
     for i in range(num_triplets):
         idx = i * 3
-        if idx + 2 >= len(data):
-            break
-        
         range_id = data[idx] & 0xFF
         value_low = data[idx + 1] & 0xFF
         value_high = data[idx + 2] & 0xFF
@@ -254,9 +261,7 @@ def handle_version(client: 'RaySIDClient', data: bytes) -> None:
     if len(data) >= 4:
         version = data[0] & 0xFF
         subversion = data[1] & 0xFF
-        build = 0
-        if len(data) >= 4:
-            build = ((data[2] & 0xFF) * 256) + (data[3] & 0xFF)
+        build = ((data[2] & 0xFF) * 256) + (data[3] & 0xFF)
         
         # Sanity check
         if version > 10 or subversion > 99:
@@ -304,75 +309,75 @@ def handle_spectrum(client: 'RaySIDClient', bArr2: bytes, packet_type: int = Non
         channels_div = 3
     elif pkt_type == 0x32:
         channels_div = 9
-    
-    # Parse starting channel
+
+    channels = client.spectrum_data.channels
+    received = client._spectrum_channel_received
+    n_channels = len(channels)
+    n_received = len(received)
+
+    def store(channel: int, value: int) -> int:
+        """Write value into `channels_div` consecutive channels; return next channel."""
+        v = max(0, value // channels_div)
+        for _ in range(channels_div):
+            if channel < n_channels:
+                channels[channel] = v
+                if channel < n_received:
+                    received[channel] = True
+                channel += 1
+        return channel
+
+    # Parse starting channel and first absolute value
     channel = two_bytes_to_int(bArr2[3], bArr2[2])
-    
-    # First value
     value = ((bArr2[6] & 0xFF) << 16) | ((bArr2[5] & 0xFF) << 8) | (bArr2[4] & 0xFF)
-    
+
     start_channel = channel
-    
-    # Store first value
-    for _ in range(channels_div):
-        if 0 <= channel < len(client.spectrum_data.channels):
-            client.spectrum_data.channels[channel] = value // channels_div
-            if channel < len(client._spectrum_channel_received):
-                client._spectrum_channel_received[channel] = True
-            channel += 1
-    
-    # Parse delta-encoded values
+    channel = store(channel, value)
+
+    # Parse delta-encoded values. Bound verified against decompiled
+    # Main.java v1.3.1e: Java scans `i < length - 4` on the full packet
+    # (checksum attached); bArr2 here is the packet minus its 3 checksum
+    # bytes, so len - 1 is the identical bound.
     i = 7
     data_end = len(bArr2) - 1
-    
+
     while i < data_end:
         control = bArr2[i] & 0xFF
         encoding_type = control // 64
         count = control % 64
-        
+
         if control == 0:
             encoding_type = 4
             count = 1
-        
+
         i += 1
-        
+
         if encoding_type == 0:
-            # 4-bit deltas
+            # 4-bit deltas (2 per byte, signed nibbles)
             j = 0
             while j < count:
                 if i >= len(bArr2):
                     break
                 byte_val = bArr2[i] & 0xFF
-                
+
                 delta = byte_val // 16
                 if delta > 7:
                     delta -= 16
                 value += delta
-                for _ in range(channels_div):
-                    if channel < len(client.spectrum_data.channels):
-                        client.spectrum_data.channels[channel] = max(0, value // channels_div)
-                        if channel < len(client._spectrum_channel_received):
-                            client._spectrum_channel_received[channel] = True
-                        channel += 1
+                channel = store(channel, value)
                 j += 1
-                
+
                 if j < count:
                     delta = byte_val % 16
                     if delta > 7:
                         delta -= 16
                     value += delta
-                    for _ in range(channels_div):
-                        if channel < len(client.spectrum_data.channels):
-                            client.spectrum_data.channels[channel] = max(0, value // channels_div)
-                            if channel < len(client._spectrum_channel_received):
-                                client._spectrum_channel_received[channel] = True
-                            channel += 1
+                    channel = store(channel, value)
                     j += 1
-                
+
                 i += 1
-                
+
         elif encoding_type == 1:
-            # 8-bit deltas
+            # 8-bit deltas (signed bytes)
             for j in range(count):
                 if i >= len(bArr2):
                     break
@@ -380,16 +385,11 @@ def handle_spectrum(client: 'RaySIDClient', bArr2: bytes, packet_type: int = Non
                 if delta > 127:
                     delta -= 256
                 value += delta
-                for _ in range(channels_div):
-                    if channel < len(client.spectrum_data.channels):
-                        client.spectrum_data.channels[channel] = max(0, value // channels_div)
-                        if channel < len(client._spectrum_channel_received):
-                            client._spectrum_channel_received[channel] = True
-                        channel += 1
+                channel = store(channel, value)
                 i += 1
-                
+
         elif encoding_type == 2:
-            # 12-bit deltas
+            # 12-bit deltas (signed, packed 2 per 3 bytes)
             j = 0
             while j < count:
                 if i + 1 >= len(bArr2):
@@ -399,15 +399,10 @@ def handle_spectrum(client: 'RaySIDClient', bArr2: bytes, packet_type: int = Non
                 if delta > 2047:
                     delta -= 4096
                 value += delta
-                for _ in range(channels_div):
-                    if channel < len(client.spectrum_data.channels):
-                        client.spectrum_data.channels[channel] = max(0, value // channels_div)
-                        if channel < len(client._spectrum_channel_received):
-                            client._spectrum_channel_received[channel] = True
-                        channel += 1
+                channel = store(channel, value)
                 j += 1
                 i += 2
-                
+
                 if j < count:
                     if i >= len(bArr2):
                         break
@@ -415,17 +410,12 @@ def handle_spectrum(client: 'RaySIDClient', bArr2: bytes, packet_type: int = Non
                     if delta > 2047:
                         delta -= 4096
                     value += delta
-                    for _ in range(channels_div):
-                        if channel < len(client.spectrum_data.channels):
-                            client.spectrum_data.channels[channel] = max(0, value // channels_div)
-                            if channel < len(client._spectrum_channel_received):
-                                client._spectrum_channel_received[channel] = True
-                            channel += 1
+                    channel = store(channel, value)
                     j += 1
                     i += 1
-                
+
         elif encoding_type == 3:
-            # 16-bit deltas
+            # 16-bit deltas (signed)
             for j in range(count):
                 if i + 1 >= len(bArr2):
                     break
@@ -433,39 +423,19 @@ def handle_spectrum(client: 'RaySIDClient', bArr2: bytes, packet_type: int = Non
                 if delta > 32767:
                     delta -= 65536
                 value += delta
-                for _ in range(channels_div):
-                    if channel < len(client.spectrum_data.channels):
-                        client.spectrum_data.channels[channel] = max(0, value // channels_div)
-                        if channel < len(client._spectrum_channel_received):
-                            client._spectrum_channel_received[channel] = True
-                        channel += 1
+                channel = store(channel, value)
                 i += 2
-                
+
         elif encoding_type == 4:
-            # 24-bit delta
+            # 24-bit delta (signed)
             if i + 2 >= len(bArr2):
                 break
             delta = ((bArr2[i+2] & 0xFF) << 16) | ((bArr2[i+1] & 0xFF) << 8) | (bArr2[i] & 0xFF)
             if delta > 8388607:
                 delta -= 16777216
             value += delta
-            for _ in range(channels_div):
-                if channel < len(client.spectrum_data.channels):
-                    client.spectrum_data.channels[channel] = max(0, value // channels_div)
-                    if channel < len(client._spectrum_channel_received):
-                        client._spectrum_channel_received[channel] = True
-                    channel += 1
+            channel = store(channel, value)
             i += 3
-    
-    # Track progress
-    client.spectrum_last_start_channel = start_channel
-    client.spectrum_position = max(client.spectrum_position, channel)
-    client.spectrum_min_channel = min(client.spectrum_min_channel, start_channel)
-    
-    if start_channel < 100:
-        client._spectrum_seen_low = True
-    if channel >= 1750:
-        client._spectrum_seen_high = True
     
     if channel % 200 == 0 or channel >= 1790:
         logger.debug(f"Spectrum progress: ch {start_channel}-{channel}")
@@ -480,7 +450,7 @@ def handle_battery(client: 'RaySIDClient', data: bytes) -> None:
     """Handle Type 0x5C - Battery status."""
     if len(data) >= 2:
         client.device_info.battery_percent = data[0]
-        client.device_info.battery_voltage = data[1] / 10.0 if len(data) > 1 else 0
+        client.device_info.battery_voltage = data[1] / 10.0
         logger.debug(f"Battery: {client.device_info.battery_percent}%")
 
 

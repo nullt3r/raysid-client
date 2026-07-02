@@ -25,11 +25,6 @@ class Colors:
     WARNING = '\033[33m'    # Yellow
     ERROR = '\033[91m'      # Red
     CRITICAL = '\033[91m\033[1m'  # Bold Red
-    
-    # Component colors
-    BLE = '\033[94m'        # Blue
-    SPECTRUM = '\033[95m'   # Magenta
-    AUDIO = '\033[96m'      # Cyan
 
 
 class ColoredFormatter(logging.Formatter):

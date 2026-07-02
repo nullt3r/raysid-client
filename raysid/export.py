@@ -168,38 +168,10 @@ def export_spectrum_csv(
     path: str,
     include_energy: bool = True
 ) -> None:
-    """Export spectrum data to CSV file.
-    
-    Args:
-        spectrum: Spectrum data to export
-        path: Output file path
-        include_energy: Include energy (keV) column
-    """
+    """Export spectrum data to CSV file (format: SpectrumData.to_csv)."""
     with open(path, 'w') as f:
-        # Metadata header
-        f.write(f"# RaySID Gamma Spectrum Data\n")
-        f.write(f"# Timestamp: {datetime.fromtimestamp(spectrum.timestamp).isoformat()}\n")
-        f.write(f"# Device ID: {spectrum.device_id or 'Unknown'}\n")
-        f.write(f"# Energy Range: {spectrum.get_energy_range_str()}\n")
-        f.write(f"# Total Counts: {spectrum.total_counts}\n")
-        f.write(f"# Acquisition Time: {spectrum.acquisition_time:.1f} s\n")
-        f.write(f"# Live Time: {spectrum.live_time:.1f} s\n")
-        f.write(f"# Real Time: {spectrum.real_time:.1f} s\n")
-        f.write(f"# Temperature: {spectrum.temperature:.1f} C\n")
-        f.write(f"# Channels: {len(spectrum.channels)}\n")
-        f.write(f"#\n")
-        
-        # Data
-        if include_energy:
-            f.write("channel,energy_kev,counts\n")
-            for i, counts in enumerate(spectrum.channels):
-                energy = spectrum.channel_to_kev(i)
-                f.write(f"{i},{energy:.2f},{counts}\n")
-        else:
-            f.write("channel,counts\n")
-            for i, counts in enumerate(spectrum.channels):
-                f.write(f"{i},{counts}\n")
-    
+        f.write(spectrum.to_csv(include_energy=include_energy))
+        f.write("\n")
     logger.info(f"Spectrum CSV saved: {path}")
 
 
@@ -208,60 +180,13 @@ def export_spectrum_json(
     path: str,
     include_energy_axis: bool = False
 ) -> None:
-    """Export spectrum data to JSON file.
-    
-    Args:
-        spectrum: Spectrum data to export
-        path: Output file path
-        include_energy_axis: Include pre-calculated energy axis
-    """
-    output = {
-        'metadata': {
-            'type': 'gamma_spectrum',
-            'timestamp_iso': datetime.fromtimestamp(spectrum.timestamp).isoformat(),
-            'timestamp_unix': spectrum.timestamp,
-            'device_id': spectrum.device_id or 'Unknown',
-            'energy_range': spectrum.get_energy_range_str(),
-            'energy_range_code': spectrum.energy_range,
-            'total_counts': spectrum.total_counts,
-            'acquisition_time_s': spectrum.acquisition_time,
-            'live_time_s': spectrum.live_time,
-            'real_time_s': spectrum.real_time,
-            'temperature_c': spectrum.temperature,
-            'num_channels': len(spectrum.channels),
-        },
-        'channels': spectrum.channels,
-    }
-    
+    """Export spectrum data to JSON file (format: SpectrumData.to_dict)."""
+    output = spectrum.to_dict()
     if include_energy_axis:
         output['energy_axis_kev'] = spectrum.get_energy_axis()
-    
     with open(path, 'w') as f:
         json.dump(output, f, indent=2)
-    
     logger.info(f"Spectrum JSON saved: {path}")
-
-
-def export_spectrum_graph(
-    spectrum: 'SpectrumData',
-    path: str,
-    log_scale: bool = False,
-    show_peaks: bool = True,
-    title: Optional[str] = None
-) -> bool:
-    """Export spectrum as graph image.
-    
-    Args:
-        spectrum: Spectrum data to export
-        path: Output file path (.png, .pdf, .svg)
-        log_scale: Use logarithmic Y axis
-        show_peaks: Annotate detected peaks
-        title: Custom title
-        
-    Returns:
-        True if successful
-    """
-    return spectrum.save_graph(path, log_scale=log_scale, show_peaks=show_peaks, title=title)
 
 
 def save_spectrum(
@@ -269,47 +194,34 @@ def save_spectrum(
     base_name: str,
     save_csv: bool = True,
     save_json: bool = True,
-    save_graph: bool = True,
-    log_scale: bool = False,
-    show_peaks: bool = True,
-    title: Optional[str] = None
 ) -> List[str]:
-    """Save spectrum to multiple formats.
-    
+    """Save spectrum to CSV and/or JSON.
+
     Args:
         spectrum: Spectrum data to save
         base_name: Base filename (extensions added automatically)
         save_csv: Save CSV file
         save_json: Save JSON file
-        save_graph: Save PNG graph
-        log_scale: Use log scale for graph
-        show_peaks: Show peaks on graph
-        title: Custom graph title
-        
+
     Returns:
         List of saved file paths
     """
     saved_files = []
-    
+
     # Remove extension if present
-    if base_name.endswith(('.json', '.csv', '.png', '.pdf', '.svg')):
+    if base_name.endswith(('.json', '.csv')):
         base_name = base_name.rsplit('.', 1)[0]
-    
+
     if save_csv:
         csv_path = f"{base_name}.csv"
         export_spectrum_csv(spectrum, csv_path)
         saved_files.append(csv_path)
-    
+
     if save_json:
         json_path = f"{base_name}.json"
         export_spectrum_json(spectrum, json_path)
         saved_files.append(json_path)
-    
-    if save_graph:
-        graph_path = f"{base_name}.png"
-        if export_spectrum_graph(spectrum, graph_path, log_scale, show_peaks, title):
-            saved_files.append(graph_path)
-    
+
     return saved_files
 
 
