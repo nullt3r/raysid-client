@@ -435,33 +435,84 @@ class RaySIDClient:
         logger.debug(f"RX char {self._rx_char.uuid}, TX char {self._tx_char.uuid}")
         return True
 
-    async def _open_connection(self, target) -> bool:
-        """Connect to a BLEDevice or address string and start notifications."""
-        self.client = BleakClient(target, disconnected_callback=self._on_disconnect)
-        try:
-            await self.client.connect()
-        except Exception as e:
-            logger.error(f"Connection failed: {e}")
-            return False
-        if not self._resolve_characteristics():
+    async def _wait_for_services(self, timeout: float = 12.0) -> bool:
+        """Wait until GATT characteristics are populated.
+
+        BlueZ frequently reports the link as connected before (or without)
+        finishing service discovery, so `client.services` can be empty for
+        a moment right after connect. Poll until the characteristics show
+        up or the device drops us.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if not self.client.is_connected:
+                return False
             try:
-                await self.client.disconnect()
+                if self.client.services.characteristics:
+                    return True
             except Exception:
-                pass
-            return False
-        try:
-            await self.client.start_notify(self._rx_char, self._notification_handler)
-        except Exception as e:
-            logger.error(f"Could not subscribe to notifications: {e}")
+                pass  # discovery not done yet
+            await asyncio.sleep(0.3)
+        return False
+
+    async def _open_connection(self, target, attempts: int = 3) -> bool:
+        """Connect, wait for service discovery, and subscribe to notifications.
+
+        Retries the whole handshake a few times — BlueZ service discovery
+        is flaky and often succeeds only on the 2nd or 3rd attempt.
+        """
+        for attempt in range(1, attempts + 1):
+            self.client = BleakClient(target, disconnected_callback=self._on_disconnect)
             try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-            return False
-        self.connected = True
-        self._intentional_disconnect = False
-        logger.info(f"Connected to RaySID [{self.client.address}]")
-        return True
+                await self.client.connect()
+            except Exception as e:
+                logger.warning(f"Connect attempt {attempt}/{attempts} failed: {e}")
+                await asyncio.sleep(1.0)
+                continue
+
+            if not await self._wait_for_services():
+                logger.warning(f"Attempt {attempt}/{attempts}: service discovery "
+                               f"did not complete (BlueZ can be flaky here)")
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+                continue
+
+            if not self._resolve_characteristics():
+                # Characteristics enumerated but none matched — retrying
+                # won't help; the diagnostic table was already logged.
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                return False
+
+            try:
+                await self.client.start_notify(self._rx_char, self._notification_handler)
+            except Exception as e:
+                logger.warning(f"Attempt {attempt}/{attempts}: notify subscribe "
+                               f"failed: {e}")
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+                continue
+
+            self.connected = True
+            self._intentional_disconnect = False
+            logger.info(f"Connected to RaySID [{self.client.address}]")
+            return True
+
+        logger.error("Could not establish a working connection after "
+                     f"{attempts} attempts.")
+        logger.error("If the signal is weak (RSSI below ~-80 dBm), move the "
+                     "device closer. Make sure the phone app is NOT connected "
+                     "at the same time — the RaySID allows only one link.")
+        return False
 
     async def scan_and_connect(self, target_address: Optional[str] = None) -> bool:
         """Scan for and connect to a RaySID device.
