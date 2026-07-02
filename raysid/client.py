@@ -110,6 +110,12 @@ class RaySIDClient:
         # bare address string; on BlueZ this is far more reliable because
         # it carries the backend object path (no internal re-scan).
         self._ble_device = None
+        # Resolved GATT characteristic objects (RX = notify, TX = write).
+        # Cached after connect so we don't re-look-up on every packet and
+        # so we can fall back to property-matching when a backend (BlueZ)
+        # enumerates the UART characteristics differently.
+        self._rx_char = None
+        self._tx_char = None
         # Keepalive task — must hold a reference: asyncio only keeps weak
         # references to tasks, so a bare create_task() can be GC'd mid-run.
         self._ping_task: Optional[asyncio.Task] = None
@@ -326,7 +332,8 @@ class RaySIDClient:
         ble_logger.debug(f"TX: Cmd 0x{command:02X}")
         
         try:
-            await self.client.write_gatt_char(TX_CHAR_UUID, packet, response=False)
+            await self.client.write_gatt_char(
+                self._tx_char or TX_CHAR_UUID, packet, response=False)
         except Exception as e:
             logger.error(f"TX error: {e}")
             self.connected = False
@@ -380,6 +387,54 @@ class RaySIDClient:
                     f"(RSSI {rssi} dBm)")
         return device
 
+    def _resolve_characteristics(self) -> bool:
+        """Locate the RX (notify) and TX (write) characteristics.
+
+        Tries the known UART UUIDs first; if a backend enumerated them
+        differently (or a stale GATT cache hides them), falls back to
+        matching by property. Logs the whole discovered GATT table when
+        it can't find them, so the failure is diagnosable.
+        """
+        self._rx_char = None
+        self._tx_char = None
+        try:
+            services = self.client.services
+        except Exception as e:
+            logger.error(f"GATT services not resolved: {e}")
+            return False
+
+        base = SERVICE_UUID.split("-")[0].lower()  # ISSC UART base prefix
+        for char in services.characteristics.values():
+            uuid = char.uuid.lower()
+            props = set(char.properties)
+            if uuid == RX_CHAR_UUID.lower():
+                self._rx_char = char
+            elif uuid == TX_CHAR_UUID.lower():
+                self._tx_char = char
+        # Property-based fallback within the UART service
+        if self._rx_char is None or self._tx_char is None:
+            for char in services.characteristics.values():
+                if not char.uuid.lower().startswith(base):
+                    continue
+                props = set(char.properties)
+                if self._rx_char is None and ("notify" in props or "indicate" in props):
+                    self._rx_char = char
+                if self._tx_char is None and (
+                        "write" in props or "write-without-response" in props):
+                    self._tx_char = char
+
+        if self._rx_char is None or self._tx_char is None:
+            logger.error("Could not find the RaySID UART characteristics.")
+            logger.error("Discovered GATT characteristics:")
+            for char in services.characteristics.values():
+                logger.error(f"  {char.uuid}  [{', '.join(char.properties)}]")
+            logger.error("If this list looks wrong or empty, BlueZ may have a "
+                         "stale GATT cache — run "
+                         f"`bluetoothctl remove {self.client.address}` and retry.")
+            return False
+        logger.debug(f"RX char {self._rx_char.uuid}, TX char {self._tx_char.uuid}")
+        return True
+
     async def _open_connection(self, target) -> bool:
         """Connect to a BLEDevice or address string and start notifications."""
         self.client = BleakClient(target, disconnected_callback=self._on_disconnect)
@@ -388,8 +443,14 @@ class RaySIDClient:
         except Exception as e:
             logger.error(f"Connection failed: {e}")
             return False
+        if not self._resolve_characteristics():
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            return False
         try:
-            await self.client.start_notify(RX_CHAR_UUID, self._notification_handler)
+            await self.client.start_notify(self._rx_char, self._notification_handler)
         except Exception as e:
             logger.error(f"Could not subscribe to notifications: {e}")
             try:
@@ -490,7 +551,9 @@ class RaySIDClient:
                                           disconnected_callback=self._on_disconnect)
                 await self.client.connect()
 
-                await self.client.start_notify(RX_CHAR_UUID, self._notification_handler)
+                if not self._resolve_characteristics():
+                    raise RuntimeError("UART characteristics not found after reconnect")
+                await self.client.start_notify(self._rx_char, self._notification_handler)
                 self.connected = True
                 self._intentional_disconnect = False
 
@@ -536,7 +599,8 @@ class RaySIDClient:
         
         if self.client and self.client.is_connected:
             try:
-                await self.client.stop_notify(RX_CHAR_UUID)
+                if self._rx_char is not None:
+                    await self.client.stop_notify(self._rx_char)
                 await self.client.disconnect()
                 logger.info("Disconnected from device")
             except Exception as e:
