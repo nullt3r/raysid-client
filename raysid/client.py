@@ -435,6 +435,24 @@ class RaySIDClient:
         logger.debug(f"RX char {self._rx_char.uuid}, TX char {self._tx_char.uuid}")
         return True
 
+    def _make_client(self, target) -> BleakClient:
+        """Build a BleakClient tuned for reliable BlueZ connection.
+
+        - pair=True bonds before connecting. Many BLE devices (the RaySID
+          included) drop an unbonded link within a few seconds on BlueZ,
+          before service discovery can finish; bonding makes the device
+          hold the connection and lets BlueZ cache the GATT table. No
+          effect on macOS (CoreBluetooth pairs on demand).
+        - services=[UART] limits discovery to the one service we use, so
+          it completes fast enough to beat the device's idle drop.
+        """
+        return BleakClient(
+            target,
+            disconnected_callback=self._on_disconnect,
+            pair=True,
+            services=[SERVICE_UUID],
+        )
+
     async def _wait_for_services(self, timeout: float = 12.0) -> bool:
         """Wait until GATT characteristics are populated.
 
@@ -463,7 +481,7 @@ class RaySIDClient:
         is flaky and often succeeds only on the 2nd or 3rd attempt.
         """
         for attempt in range(1, attempts + 1):
-            self.client = BleakClient(target, disconnected_callback=self._on_disconnect)
+            self.client = self._make_client(target)
             try:
                 await self.client.connect()
             except Exception as e:
@@ -598,8 +616,7 @@ class RaySIDClient:
                 if connect_target is None:
                     raise RuntimeError("no device or address to reconnect to")
 
-                self.client = BleakClient(connect_target,
-                                          disconnected_callback=self._on_disconnect)
+                self.client = self._make_client(connect_target)
                 await self.client.connect()
 
                 if not self._resolve_characteristics():
