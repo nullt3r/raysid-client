@@ -532,6 +532,38 @@ class RaySIDClient:
                      "at the same time — the RaySID allows only one link.")
         return False
 
+    async def _remove_bond(self) -> None:
+        """Remove the BlueZ bond/device entry (like `bluetoothctl remove`).
+
+        We bond on connect (pair=True). A bond left behind by a previous
+        run — especially one that was hard-killed without a clean
+        disconnect — can block the next connection, so we clear it. No-op
+        / harmless on macOS.
+        """
+        if self.client is None:
+            return
+        try:
+            await self.client.unpair()
+            logger.debug("Removed BlueZ bond for the device")
+        except Exception as e:
+            logger.debug(f"Bond removal skipped: {e}")
+
+    async def _connect_with_recovery(self, target) -> bool:
+        """Connect; if it fails, drop any stale bond and try once more.
+
+        Recovers the common Linux case where a previous session was killed
+        without disconnecting, leaving a half-open bond that refuses new
+        connections until the device is removed from BlueZ.
+        """
+        if await self._open_connection(target):
+            return True
+        logger.info("Connection failed — clearing any stale BlueZ bond and retrying...")
+        await self._remove_bond()
+        # Reconnect by address so BlueZ re-discovers the device cleanly
+        # (its cached object path is invalid after removal).
+        retry_target = self.target_address or target
+        return await self._open_connection(retry_target)
+
     async def scan_and_connect(self, target_address: Optional[str] = None) -> bool:
         """Scan for and connect to a RaySID device.
 
@@ -549,7 +581,7 @@ class RaySIDClient:
             self.target_address = target_address
             logger.info(f"Connecting to {target_address}...")
             connect_target = self._ble_device or target_address
-            return await self._open_connection(connect_target)
+            return await self._connect_with_recovery(connect_target)
 
         device = await self._scan_for_device()
         if device is None:
@@ -558,7 +590,7 @@ class RaySIDClient:
         self._ble_device = device
         self.target_address = device.address
         logger.info(f"Connecting to {device.address}...")
-        return await self._open_connection(device)
+        return await self._connect_with_recovery(device)
     
     def _on_disconnect(self, client: BleakClient) -> None:
         """Callback when device disconnects unexpectedly."""
@@ -673,6 +705,10 @@ class RaySIDClient:
                 logger.info("Disconnected from device")
             except Exception as e:
                 logger.error(f"Error during disconnect: {e}")
+
+        # Remove the BlueZ bond so the next run starts fresh — a lingering
+        # bond otherwise tends to block the following connection on Linux.
+        await self._remove_bond()
     
     # ==================== INITIALIZATION ====================
     
