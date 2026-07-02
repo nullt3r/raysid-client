@@ -63,6 +63,11 @@ pip install -e ".[tui]"      # + the full-screen dashboard
 pip install -e ".[audio]"    # + Geiger click sounds
 ```
 
+The `audio` extra needs the system **PortAudio** library at runtime. On
+Linux install it first (`sudo apt install libportaudio2`, or your distro's
+equivalent); macOS ships it. Without it, everything still works — only the
+click sounds are silently disabled.
+
 The device is auto-discovered over Bluetooth — just make sure it's powered
 on and nearby. On Linux you may need to be in the `bluetooth` group; on
 macOS grant Bluetooth permission to your terminal.

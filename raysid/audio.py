@@ -13,12 +13,15 @@ from .logging_config import get_audio_logger
 
 logger = get_audio_logger()
 
-# Try to import audio dependencies
+# Try to import audio dependencies. sounddevice raises OSError (not
+# ImportError) when the system PortAudio library is missing — common on
+# a fresh Linux box without libportaudio2 — so catch that too and just
+# disable audio instead of crashing the whole app.
 try:
     import numpy as np
     import sounddevice as sd
     AUDIO_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     AUDIO_AVAILABLE = False
     np = None
     sd = None
